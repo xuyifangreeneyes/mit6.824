@@ -1,15 +1,43 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
+import (
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
+type TaskKind int
+
+const (
+	KindMap TaskKind = iota
+	KindReduce
+)
+
+type TaskStatus int
+
+const (
+	Idle TaskStatus = iota
+	InProgress
+	Completed
+)
+
+type TaskInfo struct {
+	Task
+	Status    TaskStatus
+	StartTime time.Time
+}
 
 type Master struct {
 	// Your definitions here.
-
+	mu           sync.Mutex
+	numTask      int
+	numMapTask   int
+	numCompleted int
+	tasks        []*TaskInfo
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -24,6 +52,52 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
+func (m *Master) DispatchTask(lastTaskId int, newTask *Task) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if lastTaskId != -1 {
+		task := m.tasks[lastTaskId]
+		if task.Status == InProgress {
+			task.Status = Completed
+			m.numCompleted++
+		}
+	}
+	if m.numCompleted < m.numMapTask {
+		// There are still map tasks which are not completed.
+		// First we check Idle MapTasks.
+		for i := 0; i < m.numMapTask; i++ {
+			mapTask := m.tasks[i]
+			if mapTask.Status == Idle {
+				mapTask.Status = InProgress
+				mapTask.StartTime = time.Now()
+				newTask = &Task{
+					Id:         mapTask.Id,
+					Kind:       KindMap,
+					InputFiles: mapTask.InputFiles,
+				}
+				return nil
+			}
+		}
+		// If there is no Idle MapTask, we check whether exists any InProgress MapTask which is timeout.
+		for i := 0; i < m.numMapTask; i++ {
+			mapTask := m.tasks[i]
+			if mapTask.Status == InProgress {
+				t := time.Now()
+				if t.Sub(mapTask.StartTime).Seconds() > 10 {
+					mapTask.StartTime = t
+					newTask = &Task{
+						Id:         mapTask.Id,
+						Kind:       KindMap,
+						InputFiles: mapTask.InputFiles,
+					}
+					return nil
+				}
+			}
+		}
+	} else {
+
+	}
+}
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -50,7 +124,6 @@ func (m *Master) Done() bool {
 
 	// Your code here.
 
-
 	return ret
 }
 
@@ -63,7 +136,6 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	// Your code here.
-
 
 	m.server()
 	return &m
