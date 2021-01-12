@@ -143,15 +143,11 @@ func runTask(task *Task, numTask, numMapTask int, mapf func(string, string) []Ke
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
-
 	lastTaskId := -1
 	for {
 		var reply DispatchReply
-		if ok := call("Master.Example", lastTaskId, &reply); ok {
+		if ok := call("Master.DispatchTask", lastTaskId, &reply); ok {
+			// fmt.Println("worker receives reply")
 			switch reply.Status {
 			case Assigned:
 				runTask(&reply.Task, reply.NumTask, reply.NumMapTask, mapf, reducef)
@@ -183,7 +179,7 @@ func CallExample() {
 	reply := ExampleReply{}
 
 	// send the RPC request, wait for the reply.
-	call("Master.DispatchTask", &args, &reply)
+	call("Master.Example", &args, &reply)
 
 	// reply.Y should be 100.
 	fmt.Printf("reply.Y %v\n", reply.Y)

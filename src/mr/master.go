@@ -55,6 +55,7 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 func (m *Master) DispatchTask(lastTaskId int, reply *DispatchReply) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// fmt.Println("master dispatches task")
 	if lastTaskId != -1 {
 		task := m.tasks[lastTaskId]
 		if task.Status == InProgress {
@@ -63,9 +64,7 @@ func (m *Master) DispatchTask(lastTaskId int, reply *DispatchReply) error {
 		}
 	}
 	if m.numCompleted == m.numTask {
-		reply = &DispatchReply{
-			Status: JobDone,
-		}
+		reply.Status = JobDone
 		return nil
 	}
 	if m.numCompleted < m.numMapTask {
@@ -85,12 +84,11 @@ func (m *Master) dispatchTask(startId, endId int, reply *DispatchReply) {
 		if taskInfo.Status == Idle {
 			taskInfo.Status = InProgress
 			taskInfo.StartTime = time.Now()
-			reply = &DispatchReply{
-				Status:     Assigned,
-				Task:       taskInfo.Task,
-				NumTask:    m.numTask,
-				NumMapTask: m.numMapTask,
-			}
+			// fill in reply
+			reply.Status = Assigned
+			reply.Task = taskInfo.Task
+			reply.NumTask = m.numTask
+			reply.NumMapTask = m.numMapTask
 			return
 		}
 	}
@@ -102,19 +100,16 @@ func (m *Master) dispatchTask(startId, endId int, reply *DispatchReply) {
 			if t.Sub(taskInfo.StartTime).Seconds() > 10 {
 				// The in-progress task is timeout so re-dispatch the task.
 				taskInfo.StartTime = t
-				reply = &DispatchReply{
-					Status:     Assigned,
-					Task:       taskInfo.Task,
-					NumTask:    m.numTask,
-					NumMapTask: m.numMapTask,
-				}
+				// fill in reply
+				reply.Status = Assigned
+				reply.Task = taskInfo.Task
+				reply.NumTask = m.numTask
+				reply.NumMapTask = m.numMapTask
 				return
 			}
 		}
 	}
-	reply = &DispatchReply{
-		Status: Pending,
-	}
+	reply.Status = Pending
 }
 
 //

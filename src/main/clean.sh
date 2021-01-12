@@ -1,0 +1,1 @@
+rm -rf mr-tmp mrmaster mrsequential mrworker mr-*-* mr-out-* *.so
