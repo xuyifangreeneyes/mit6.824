@@ -29,6 +29,22 @@ type Task struct {
 	InputFiles []string
 }
 
+type DispatchStatus int
+
+const (
+	Assigned DispatchStatus = iota // Master assigns a task to worker
+	Pending                        // Currently there is no task to be assigned to worker but the mapreduce job is not finished.
+	// For example, reduce tasks cannot be assigned when there still exists some in-progress map task.
+	JobDone // The mapreduce job is done
+)
+
+type DispatchReply struct {
+	Status     DispatchStatus
+	Task       Task
+	NumTask    int
+	NumMapTask int
+}
+
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
 // Can't use the current directory since
