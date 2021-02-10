@@ -23,8 +23,15 @@ import "../labrpc"
 
 // import "bytes"
 // import "../labgob"
+import "time"
 
+type Role int
 
+const (
+	Follower Role = iota
+	Leader
+	Candidate
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -56,7 +63,27 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	role      Role
+	startTime time.Time           // election timer
+	raftState
+}
 
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
+
+type raftState struct {
+	// persistent state on all servers
+	currentTerm int
+	votedFor    int
+	log         []LogEntry
+	// volatile state on all servers
+	commitIndex int
+	lastApplied int
+	// volatile state on leaders
+	nextIndex   []int
+	matchIndex  []int
 }
 
 // return currentTerm and whether this server
@@ -117,6 +144,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -125,6 +156,38 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+// term1(term2) is the term of the last entries of log1(log2).
+// index1(index2) is the index of the last entries of log1(log2).
+// The return value is -1 whether log1 is less up-to-date than log2.
+// The return value is 0 whether log1 is even up-to-date than log2.
+// The return value is 1 whether log1 is more up-to-date than log2.
+func compareLog(term1, index1, term2, index2 int) int {
+	if term1 == term2 {
+		if index1 < index2 {
+			return -1
+		}
+		if index1 == index2 {
+			return 0
+		}
+		return 1
+	}
+	if term1 < term2 {
+		return -1
+	}
+	return 1
+}
+
+// rf must hold lock when calling the function.
+func (rf *Raft) updateTerm(newTerm int) {
+	rf.role = Follower
+	rf.currentTerm = newTerm
+	rf.votedFor = -1
+	rf.nextIndex = nil
+	rf.matchIndex = nil
 }
 
 //
@@ -132,6 +195,25 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.updateTerm(args.Term)
+	}
+	reply.Term = rf.currentTerm
+	lastLogIndex := len(rf.log) - 1
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && compareLog(args.LastLogTerm, args.LastLogIndex, rf.log[lastLogIndex].Term, lastLogIndex) >= 0 {
+		reply.VoteGranted = true
+		// reset the election timer
+		rf.startTime = time.Now()
+		return
+	}
+	reply.VoteGranted = false
 }
 
 //
@@ -168,6 +250,59 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesRelpy struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRelpy) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.updateTerm(args.Term)
+	}
+	reply.Term = rf.currentTerm
+	// reset the election timer
+	rf.startTime = time.Now()
+	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+	startIndex := args.PrevLogIndex + 1
+	for i, entry := range args.Entries {
+		if startIndex + i == len(rf.log) {
+			rf.log = append(rf.log, args.Entries[i:]...)
+			break
+		}
+		if entry.Term != rf.log[startIndex + i].Term {
+			rf.log = append(rf.log[:startIndex + i], args.Entries[i:]...)
+			break
+		}
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		lastEntryIndex := startIndex + len(args.Entries) - 1
+		if args.LeaderCommit < lastEntryIndex {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = lastEntryIndex
+		}
+	}
+	reply.Success = true
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
