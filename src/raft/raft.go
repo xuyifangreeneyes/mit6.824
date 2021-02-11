@@ -63,8 +63,12 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	role      Role
-	startTime time.Time           // election timer
+	role              Role
+	lastResetTime     time.Time           // election timer
+	winElection       chan struct{}
+	newVote           chan struct{}
+	appendSuccess     chan struct{}
+	commitIndexUpdate chan struct{}
 	raftState
 }
 
@@ -84,6 +88,8 @@ type raftState struct {
 	// volatile state on leaders
 	nextIndex   []int
 	matchIndex  []int
+	// volatile state on candidates
+	votedForMe  []bool
 }
 
 // return currentTerm and whether this server
@@ -182,12 +188,18 @@ func compareLog(term1, index1, term2, index2 int) int {
 }
 
 // rf must hold lock when calling the function.
+func (rf *Raft) resetElectionTimer() {
+	rf.lastResetTime = time.Now()
+}
+
+// rf must hold lock when calling the function.
 func (rf *Raft) updateTerm(newTerm int) {
 	rf.role = Follower
 	rf.currentTerm = newTerm
 	rf.votedFor = -1
 	rf.nextIndex = nil
 	rf.matchIndex = nil
+	rf.votedForMe = nil
 }
 
 //
@@ -209,8 +221,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	lastLogIndex := len(rf.log) - 1
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && compareLog(args.LastLogTerm, args.LastLogIndex, rf.log[lastLogIndex].Term, lastLogIndex) >= 0 {
 		reply.VoteGranted = true
-		// reset the election timer
-		rf.startTime = time.Now()
+		rf.resetElectionTimer()
 		return
 	}
 	reply.VoteGranted = false
@@ -250,6 +261,29 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) handleRequestVote(server int, args *RequestVoteArgs) {
+	reply := &RequestVoteReply{}
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if !ok {
+		// TODO: log the failure of call
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
+		rf.updateTerm(reply.Term)
+		return
+	}
+	if args.Term != rf.currentTerm {
+		// When receiving an old RPC reply, just drop the reply and return.
+		return
+	}
+	if reply.VoteGranted {
+		rf.votedForMe[server] = true
+		rf.newVote <- struct{}{}
+	}
+}
+
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
@@ -276,9 +310,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRelpy
 		rf.updateTerm(args.Term)
 	}
 	reply.Term = rf.currentTerm
-	// reset the election timer
-	rf.startTime = time.Now()
-	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	rf.resetElectionTimer()
+	if args.PrevLogIndex != -1 && (len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		reply.Success = false
 		return
 	}
@@ -294,14 +327,140 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRelpy
 		}
 	}
 	if args.LeaderCommit > rf.commitIndex {
+		oldCommitIndex := rf.commitIndex
 		lastEntryIndex := startIndex + len(args.Entries) - 1
 		if args.LeaderCommit < lastEntryIndex {
 			rf.commitIndex = args.LeaderCommit
 		} else {
 			rf.commitIndex = lastEntryIndex
 		}
+		// TODO: check whether it is always true
+		if rf.commitIndex > oldCommitIndex {
+			rf.commitIndexUpdate <- struct{}{}
+		}
 	}
 	reply.Success = true
+}
+
+func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
+	reply := &AppendEntriesRelpy{}
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if !ok {
+		// TODO: log the failure of call
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
+		rf.updateTerm(reply.Term)
+		return
+	}
+	if args.Term != rf.currentTerm {
+		// When receiving an old RPC reply, just drop the reply and return.
+		return
+	}
+	if reply.Success {
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
+		rf.appendSuccess <- struct{}{}
+	} else {
+		rf.nextIndex[server] = rf.nextIndex[server] - 1
+		prevLogIndex := rf.nextIndex[server] - 1
+		prevLogTerm := -1
+		if prevLogIndex != -1 {
+			prevLogTerm = rf.log[prevLogIndex].Term
+		}
+		newArgs := &AppendEntriesArgs{
+			Term: rf.currentTerm,
+			LeaderId: rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm: prevLogTerm,
+			Entries: rf.log[prevLogIndex + 1:],
+			LeaderCommit: rf.commitIndex,
+		}
+		go rf.handleAppendEntries(server, newArgs)
+	}
+}
+
+func (rf *Raft) checkTimeout(maxTimeInterval int64, sleepTime int) {
+	for {
+		rf.mu.Lock()
+		t := time.Since(rf.lastResetTime).Milliseconds()
+		role := rf.role
+		rf.mu.Unlock()
+		if role != Leader && t > maxTimeInterval {
+			rf.mu.Lock()
+			// double check
+			if role != Leader {
+				rf.role = Candidate
+				rf.currentTerm++
+				rf.votedFor = rf.me
+				rf.resetElectionTimer()
+				rf.votedForMe = make([]bool, len(rf.peers))
+				rf.votedForMe[rf.me] = true
+				numServers := len(rf.peers)
+				args := &RequestVoteArgs{
+					Term: rf.currentTerm,
+					CandidateId: rf.me,
+					LastLogIndex: len(rf.log) - 1,
+					LastLogTerm: rf.log[len(rf.log) - 1].Term,
+				}
+				for i := 0; i < numServers; i++ {
+					if i == rf.me {
+						continue
+					}
+					go rf.handleRequestVote(i, args)
+				}
+			}
+			rf.mu.Unlock()
+		} else {
+			time.Sleep(time.Duration(sleepTime) * time.Millisecond)
+		}
+	}
+}
+
+func (rf *Raft) checkElection() {
+	for {
+		<- rf.newVote
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if rf.role != Candidate {
+				return
+			}
+			numVotes := 0
+			for _, vote := range rf.votedForMe {
+				if vote {
+					numVotes++
+				}
+			}
+			if numVotes > len(rf.peers) / 2 {
+				rf.role = Leader
+
+			}
+		}()
+	}
+}
+
+func (rf *Raft) checkCommit() {
+	for {
+		<- rf.appendSuccess
+		rf.mu.Lock()
+		for i := len(rf.log) - 1; i > rf.commitIndex; i-- {
+			numReplicas := 0
+			for _, matchIdx := range rf.matchIndex {
+				if matchIdx >= i {
+					numReplicas++
+				}
+			}
+			if numReplicas > len(rf.peers) / 2 && rf.log[i].Term == rf.currentTerm {
+				rf.commitIndex = i
+				rf.commitIndexUpdate <- struct{}{}
+				break
+			}
+		}
+		rf.mu.Unlock()
+	}
 }
 
 //
