@@ -382,7 +382,7 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 	}
 }
 
-func (rf *Raft) checkTimeout(maxTimeInterval int64, sleepTime int) {
+func (rf *Raft) checkTimeout(maxTimeInterval int64, sleepTime int64) {
 	for {
 		rf.mu.Lock()
 		t := time.Since(rf.lastResetTime).Milliseconds()
@@ -436,7 +436,7 @@ func (rf *Raft) checkElection() {
 			}
 			if numVotes > len(rf.peers) / 2 {
 				rf.role = Leader
-
+				rf.winElection <- struct{}{}
 			}
 		}()
 	}
@@ -445,21 +445,61 @@ func (rf *Raft) checkElection() {
 func (rf *Raft) checkCommit() {
 	for {
 		<- rf.appendSuccess
-		rf.mu.Lock()
-		for i := len(rf.log) - 1; i > rf.commitIndex; i-- {
-			numReplicas := 0
-			for _, matchIdx := range rf.matchIndex {
-				if matchIdx >= i {
-					numReplicas++
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if rf.role != Leader {
+				return
+			}
+			for i := len(rf.log) - 1; i > rf.commitIndex; i-- {
+				numReplicas := 0
+				for _, matchIdx := range rf.matchIndex {
+					if matchIdx >= i {
+						numReplicas++
+					}
+				}
+				if numReplicas > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
+					rf.commitIndex = i
+					rf.commitIndexUpdate <- struct{}{}
+					break
 				}
 			}
-			if numReplicas > len(rf.peers) / 2 && rf.log[i].Term == rf.currentTerm {
-				rf.commitIndex = i
-				rf.commitIndexUpdate <- struct{}{}
+		}()
+	}
+}
+
+func (rf *Raft) keepHeartbeat(timeInterval int64) {
+	for {
+		<- rf.winElection
+		for {
+			rf.mu.Lock()
+			if rf.role != Leader {
+				rf.mu.Unlock()
 				break
 			}
+			numServers := len(rf.peers)
+			for i := 0; i < numServers; i++ {
+				if i == rf.me {
+					continue
+				}
+				prevLogIndex := rf.nextIndex[i] - 1
+				prevLogTerm := -1
+				if prevLogIndex != -1 {
+					prevLogTerm = rf.log[prevLogIndex].Term
+				}
+				args := &AppendEntriesArgs{
+					Term: rf.currentTerm,
+					LeaderId: rf.me,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm: prevLogTerm,
+					Entries: rf.log[prevLogIndex + 1:],
+					LeaderCommit: rf.commitIndex,
+				}
+				go rf.handleAppendEntries(i, args)
+			}
+			rf.mu.Unlock()
+			time.Sleep(time.Duration(timeInterval) * time.Millisecond)
 		}
-		rf.mu.Unlock()
 	}
 }
 
