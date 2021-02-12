@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -95,6 +96,13 @@ type raftState struct {
 	matchIndex  []int
 	// volatile state on candidates
 	votedForMe  []bool
+}
+
+//
+// rf must hold lock when calling the function.
+//
+func (rf *Raft) printf(format string, a ...interface{}) {
+	DPrintf(fmt.Sprintf("[id=%v][term=%v][time=%v] ", rf.me, rf.currentTerm, time.Now().Nanosecond() / int(time.Millisecond)) + format, a...)
 }
 
 // return currentTerm and whether this server
@@ -208,6 +216,7 @@ func (rf *Raft) updateTerm(newTerm int) {
 	rf.nextIndex = nil
 	rf.matchIndex = nil
 	rf.votedForMe = nil
+	rf.printf("see new term, become follower")
 }
 
 //
@@ -233,7 +242,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && compareLog(args.LastLogTerm, args.LastLogIndex, lastLogTerm, lastLogIndex) >= 0 {
 		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
 		rf.resetElectionTimer()
+		rf.printf("vote for %v", args.CandidateId)
 		return
 	}
 	reply.VoteGranted = false
@@ -293,6 +304,7 @@ func (rf *Raft) handleRequestVote(server int, args *RequestVoteArgs) {
 	}
 	if reply.VoteGranted {
 		rf.votedForMe[server] = true
+		rf.printf("voted by %v", server)
 		rf.mu.Unlock()
 		rf.newVoteCh <- struct{}{}
 	} else {
@@ -423,6 +435,7 @@ func (rf *Raft) checkTimeout(maxTimeInterval int64, sleepTime int64) {
 				rf.votedFor = rf.me
 				rf.resetElectionTimer()
 				rf.votedForMe = make([]bool, len(rf.peers))
+				rf.printf("timeout %v ms, become candidate", t)
 				numServers := len(rf.peers)
 				lastLogIndex := len(rf.log) - 1
 				lastLogTerm := -1
@@ -477,6 +490,7 @@ func (rf *Raft) checkElection() {
 					rf.nextIndex[i] = numLogEntries
 					rf.matchIndex[i] = -1
 				}
+				rf.printf("win election, become leader")
 				rf.mu.Unlock()
 				rf.winElectionCh <- struct{}{}
 			} else {
@@ -672,7 +686,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	maxTimeInterval := rand.Int63n(300) % + 300
+	maxTimeInterval := rand.Int63n(300) + 300
 	go rf.checkTimeout(maxTimeInterval, 50)
 	go rf.checkElection()
 	go rf.checkCommit()
