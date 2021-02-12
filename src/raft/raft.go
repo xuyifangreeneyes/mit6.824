@@ -17,13 +17,17 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
+import (
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labrpc"
+)
 
 // import "bytes"
 // import "../labgob"
-import "time"
 
 type Role int
 
@@ -223,7 +227,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	reply.Term = rf.currentTerm
 	lastLogIndex := len(rf.log) - 1
-	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && compareLog(args.LastLogTerm, args.LastLogIndex, rf.log[lastLogIndex].Term, lastLogIndex) >= 0 {
+	lastLogTerm := -1
+	if lastLogIndex != -1 {
+		lastLogTerm = rf.log[lastLogIndex].Term
+	}
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && compareLog(args.LastLogTerm, args.LastLogIndex, lastLogTerm, lastLogIndex) >= 0 {
 		reply.VoteGranted = true
 		rf.resetElectionTimer()
 		return
@@ -273,18 +281,22 @@ func (rf *Raft) handleRequestVote(server int, args *RequestVoteArgs) {
 		return
 	}
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
 		rf.updateTerm(reply.Term)
+		rf.mu.Unlock()
 		return
 	}
 	if args.Term != rf.currentTerm {
 		// When receiving an old RPC reply, just drop the reply and return.
+		rf.mu.Unlock()
 		return
 	}
 	if reply.VoteGranted {
 		rf.votedForMe[server] = true
+		rf.mu.Unlock()
 		rf.newVoteCh <- struct{}{}
+	} else {
+		rf.mu.Unlock()
 	}
 }
 
@@ -304,10 +316,10 @@ type AppendEntriesRelpy struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRelpy) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		rf.mu.Unlock()
 		return
 	}
 	if args.Term > rf.currentTerm {
@@ -317,8 +329,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRelpy
 	rf.resetElectionTimer()
 	if args.PrevLogIndex != -1 && (len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		reply.Success = false
+		rf.mu.Unlock()
 		return
 	}
+	reply.Success = true
 	startIndex := args.PrevLogIndex + 1
 	for i, entry := range args.Entries {
 		if startIndex + i == len(rf.log) {
@@ -338,12 +352,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRelpy
 		} else {
 			rf.commitIndex = lastEntryIndex
 		}
+		rf.mu.Unlock()
 		// TODO: check whether it is always true
 		if rf.commitIndex > oldCommitIndex {
 			rf.newCommitCh <- rf.commitIndex
 		}
+	} else {
+		rf.mu.Unlock()
 	}
-	reply.Success = true
 }
 
 func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
@@ -354,18 +370,20 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 		return
 	}
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
 		rf.updateTerm(reply.Term)
+		rf.mu.Unlock()
 		return
 	}
 	if args.Term != rf.currentTerm {
 		// When receiving an old RPC reply, just drop the reply and return.
+		rf.mu.Unlock()
 		return
 	}
 	if reply.Success {
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
+		rf.mu.Unlock()
 		rf.appendSuccessCh <- struct{}{}
 	} else {
 		rf.nextIndex[server] = rf.nextIndex[server] - 1
@@ -382,12 +400,16 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 			Entries: rf.log[prevLogIndex + 1:],
 			LeaderCommit: rf.commitIndex,
 		}
+		rf.mu.Unlock()
 		go rf.handleAppendEntries(server, newArgs)
 	}
 }
 
 func (rf *Raft) checkTimeout(maxTimeInterval int64, sleepTime int64) {
 	for {
+		if rf.killed() {
+			return
+		}
 		rf.mu.Lock()
 		t := time.Since(rf.lastResetTime).Milliseconds()
 		role := rf.role
@@ -401,13 +423,17 @@ func (rf *Raft) checkTimeout(maxTimeInterval int64, sleepTime int64) {
 				rf.votedFor = rf.me
 				rf.resetElectionTimer()
 				rf.votedForMe = make([]bool, len(rf.peers))
-				rf.votedForMe[rf.me] = true
 				numServers := len(rf.peers)
+				lastLogIndex := len(rf.log) - 1
+				lastLogTerm := -1
+				if lastLogIndex != -1 {
+					lastLogTerm = rf.log[lastLogIndex].Term
+				}
 				args := &RequestVoteArgs{
 					Term: rf.currentTerm,
 					CandidateId: rf.me,
-					LastLogIndex: len(rf.log) - 1,
-					LastLogTerm: rf.log[len(rf.log) - 1].Term,
+					LastLogIndex: lastLogIndex,
+					LastLogTerm: lastLogTerm,
 				}
 				for i := 0; i < numServers; i++ {
 					if i == rf.me {
@@ -426,21 +452,23 @@ func (rf *Raft) checkTimeout(maxTimeInterval int64, sleepTime int64) {
 func (rf *Raft) checkElection() {
 	for {
 		<- rf.newVoteCh
+		if rf.killed() {
+			return
+		}
 		func() {
 			rf.mu.Lock()
-			defer rf.mu.Unlock()
 			if rf.role != Candidate {
+				rf.mu.Unlock()
 				return
 			}
-			numVotes := 0
-			for _, vote := range rf.votedForMe {
-				if vote {
+			numVotes := 1
+			for i, vote := range rf.votedForMe {
+				if i != rf.me && vote  {
 					numVotes++
 				}
 			}
 			if numVotes > len(rf.peers) / 2 {
 				rf.role = Leader
-				rf.winElectionCh <- struct{}{}
 				numServers := len(rf.peers)
 				numLogEntries := len(rf.log)
 				rf.nextIndex = make([]int, numServers)
@@ -449,6 +477,10 @@ func (rf *Raft) checkElection() {
 					rf.nextIndex[i] = numLogEntries
 					rf.matchIndex[i] = -1
 				}
+				rf.mu.Unlock()
+				rf.winElectionCh <- struct{}{}
+			} else {
+				rf.mu.Unlock()
 			}
 		}()
 	}
@@ -457,28 +489,30 @@ func (rf *Raft) checkElection() {
 func (rf *Raft) checkCommit() {
 	for {
 		<- rf.appendSuccessCh
+		if rf.killed() {
+			return
+		}
 		func() {
 			rf.mu.Lock()
-			defer rf.mu.Unlock()
 			if rf.role != Leader {
+				rf.mu.Unlock()
 				return
 			}
 			for i := len(rf.log) - 1; i > rf.commitIndex; i-- {
 				numReplicas := 1
-				for serverId, matchIdx := range rf.matchIndex {
-					if serverId == rf.me {
-						continue
-					}
-					if matchIdx >= i {
+				for j, matchIdx := range rf.matchIndex {
+					if matchIdx >= i && j != rf.me {
 						numReplicas++
 					}
 				}
 				if numReplicas > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
 					rf.commitIndex = i
+					rf.mu.Unlock()
 					rf.newCommitCh <- rf.commitIndex
-					break
+					return
 				}
 			}
+			rf.mu.Unlock()
 		}()
 	}
 }
@@ -512,7 +546,13 @@ func (rf *Raft) broadcast() {
 func (rf *Raft) keepHeartbeat(timeInterval int64) {
 	for {
 		<- rf.winElectionCh
+		if rf.killed() {
+			return
+		}
 		for {
+			if rf.killed() {
+				return
+			}
 			rf.mu.Lock()
 			if rf.role != Leader {
 				rf.mu.Unlock()
@@ -529,6 +569,9 @@ func (rf *Raft) applyLog() {
 	for {
 		// Get commitIndex from channel rather than lock and get it from struct. Is it wired?
 		commitIndex := <- rf.newCommitCh
+		if rf.killed() {
+			return
+		}
 		for rf.lastApplied < commitIndex {
 			// How to ensure atomicity?
 			rf.applyCh <- ApplyMsg{
@@ -556,6 +599,9 @@ func (rf *Raft) applyLog() {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	if rf.killed() {
+		return -1, -1, false
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.role != Leader {
@@ -626,10 +672,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	go rf.checkTimeout(300, 50)
+	maxTimeInterval := rand.Int63n(300) % + 300
+	go rf.checkTimeout(maxTimeInterval, 50)
 	go rf.checkElection()
 	go rf.checkCommit()
-	go rf.keepHeartbeat(30)
+	go rf.keepHeartbeat(120)
 	go rf.applyLog()
 
 	return rf
