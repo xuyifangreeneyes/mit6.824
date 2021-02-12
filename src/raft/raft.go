@@ -63,12 +63,13 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	role              Role
-	lastResetTime     time.Time           // election timer
-	winElection       chan struct{}
-	newVote           chan struct{}
-	appendSuccess     chan struct{}
-	commitIndexUpdate chan struct{}
+	role            Role
+	lastResetTime   time.Time           // election timer
+	winElectionCh   chan struct{}
+	newVoteCh       chan struct{}
+	appendSuccessCh chan struct{}
+	newCommitCh     chan int
+	applyCh         chan ApplyMsg
 	raftState
 }
 
@@ -95,11 +96,10 @@ type raftState struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Your code here (2A).
-	return term, isleader
+	return rf.currentTerm, rf.role == Leader
 }
 
 //
@@ -187,12 +187,16 @@ func compareLog(term1, index1, term2, index2 int) int {
 	return 1
 }
 
+//
 // rf must hold lock when calling the function.
+//
 func (rf *Raft) resetElectionTimer() {
 	rf.lastResetTime = time.Now()
 }
 
+//
 // rf must hold lock when calling the function.
+//
 func (rf *Raft) updateTerm(newTerm int) {
 	rf.role = Follower
 	rf.currentTerm = newTerm
@@ -280,7 +284,7 @@ func (rf *Raft) handleRequestVote(server int, args *RequestVoteArgs) {
 	}
 	if reply.VoteGranted {
 		rf.votedForMe[server] = true
-		rf.newVote <- struct{}{}
+		rf.newVoteCh <- struct{}{}
 	}
 }
 
@@ -336,7 +340,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRelpy
 		}
 		// TODO: check whether it is always true
 		if rf.commitIndex > oldCommitIndex {
-			rf.commitIndexUpdate <- struct{}{}
+			rf.newCommitCh <- rf.commitIndex
 		}
 	}
 	reply.Success = true
@@ -362,7 +366,7 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 	if reply.Success {
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
-		rf.appendSuccess <- struct{}{}
+		rf.appendSuccessCh <- struct{}{}
 	} else {
 		rf.nextIndex[server] = rf.nextIndex[server] - 1
 		prevLogIndex := rf.nextIndex[server] - 1
@@ -421,7 +425,7 @@ func (rf *Raft) checkTimeout(maxTimeInterval int64, sleepTime int64) {
 
 func (rf *Raft) checkElection() {
 	for {
-		<- rf.newVote
+		<- rf.newVoteCh
 		func() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
@@ -436,7 +440,15 @@ func (rf *Raft) checkElection() {
 			}
 			if numVotes > len(rf.peers) / 2 {
 				rf.role = Leader
-				rf.winElection <- struct{}{}
+				rf.winElectionCh <- struct{}{}
+				numServers := len(rf.peers)
+				numLogEntries := len(rf.log)
+				rf.nextIndex = make([]int, numServers)
+				rf.matchIndex = make([]int, numServers)
+				for i := 0; i < numServers; i++ {
+					rf.nextIndex[i] = numLogEntries
+					rf.matchIndex[i] = -1
+				}
 			}
 		}()
 	}
@@ -444,7 +456,7 @@ func (rf *Raft) checkElection() {
 
 func (rf *Raft) checkCommit() {
 	for {
-		<- rf.appendSuccess
+		<- rf.appendSuccessCh
 		func() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
@@ -452,15 +464,18 @@ func (rf *Raft) checkCommit() {
 				return
 			}
 			for i := len(rf.log) - 1; i > rf.commitIndex; i-- {
-				numReplicas := 0
-				for _, matchIdx := range rf.matchIndex {
+				numReplicas := 1
+				for serverId, matchIdx := range rf.matchIndex {
+					if serverId == rf.me {
+						continue
+					}
 					if matchIdx >= i {
 						numReplicas++
 					}
 				}
 				if numReplicas > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
 					rf.commitIndex = i
-					rf.commitIndexUpdate <- struct{}{}
+					rf.newCommitCh <- rf.commitIndex
 					break
 				}
 			}
@@ -468,37 +483,60 @@ func (rf *Raft) checkCommit() {
 	}
 }
 
+//
+// rf must be leader and hold lock when calling the function
+//
+func (rf *Raft) broadcast() {
+	numServers := len(rf.peers)
+	for i := 0; i < numServers; i++ {
+		if i == rf.me {
+			continue
+		}
+		prevLogIndex := rf.nextIndex[i] - 1
+		prevLogTerm := -1
+		if prevLogIndex != -1 {
+			prevLogTerm = rf.log[prevLogIndex].Term
+		}
+		args := &AppendEntriesArgs{
+			Term: rf.currentTerm,
+			LeaderId: rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm: prevLogTerm,
+			Entries: rf.log[prevLogIndex + 1:],
+			LeaderCommit: rf.commitIndex,
+		}
+		go rf.handleAppendEntries(i, args)
+	}
+}
+
 func (rf *Raft) keepHeartbeat(timeInterval int64) {
 	for {
-		<- rf.winElection
+		<- rf.winElectionCh
 		for {
 			rf.mu.Lock()
 			if rf.role != Leader {
 				rf.mu.Unlock()
 				break
 			}
-			numServers := len(rf.peers)
-			for i := 0; i < numServers; i++ {
-				if i == rf.me {
-					continue
-				}
-				prevLogIndex := rf.nextIndex[i] - 1
-				prevLogTerm := -1
-				if prevLogIndex != -1 {
-					prevLogTerm = rf.log[prevLogIndex].Term
-				}
-				args := &AppendEntriesArgs{
-					Term: rf.currentTerm,
-					LeaderId: rf.me,
-					PrevLogIndex: prevLogIndex,
-					PrevLogTerm: prevLogTerm,
-					Entries: rf.log[prevLogIndex + 1:],
-					LeaderCommit: rf.commitIndex,
-				}
-				go rf.handleAppendEntries(i, args)
-			}
+			rf.broadcast()
 			rf.mu.Unlock()
 			time.Sleep(time.Duration(timeInterval) * time.Millisecond)
+		}
+	}
+}
+
+func (rf *Raft) applyLog() {
+	for {
+		// Get commitIndex from channel rather than lock and get it from struct. Is it wired?
+		commitIndex := <- rf.newCommitCh
+		for rf.lastApplied < commitIndex {
+			// How to ensure atomicity?
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command: rf.log[rf.lastApplied + 1],
+				CommandIndex: rf.lastApplied + 1,
+			}
+			rf.lastApplied++
 		}
 	}
 }
@@ -518,14 +556,20 @@ func (rf *Raft) keepHeartbeat(timeInterval int64) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != Leader {
+		return -1, -1, false
+	}
+	logEntry := LogEntry{
+		Term: rf.currentTerm,
+		Command: command,
+	}
+	rf.log = append(rf.log, logEntry)
+	rf.broadcast()
 	// Your code here (2B).
 
-
-	return index, term, isLeader
+	return len(rf.log) - 1, rf.currentTerm, true
 }
 
 //
@@ -568,10 +612,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.role = Follower
+	rf.lastResetTime = time.Now()
+	rf.winElectionCh = make(chan struct{})
+	rf.newVoteCh = make(chan struct{})
+	rf.appendSuccessCh = make(chan struct{})
+	rf.newCommitCh = make(chan int)
+	rf.votedFor = -1
+	rf.log = make([]LogEntry, 0, 10)
+	rf.commitIndex = -1
+	rf.lastApplied = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go rf.checkTimeout(300, 50)
+	go rf.checkElection()
+	go rf.checkCommit()
+	go rf.keepHeartbeat(30)
+	go rf.applyLog()
 
 	return rf
 }
