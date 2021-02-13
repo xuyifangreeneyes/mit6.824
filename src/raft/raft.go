@@ -102,7 +102,7 @@ type raftState struct {
 // rf must hold lock when calling the function.
 //
 func (rf *Raft) printf(format string, a ...interface{}) {
-	DPrintf(fmt.Sprintf("[id=%v][term=%v][time=%v] ", rf.me, rf.currentTerm, time.Now().Nanosecond() / int(time.Millisecond)) + format, a...)
+	DPrintf(fmt.Sprintf("[id=%v] [term=%v] [time=%v] ", rf.me, rf.currentTerm, time.Now().Nanosecond() / int(time.Millisecond)) + format, a...)
 }
 
 // return currentTerm and whether this server
@@ -417,7 +417,7 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 	}
 }
 
-func (rf *Raft) checkTimeout(maxTimeInterval int64, sleepTime int64) {
+func (rf *Raft) checkTimeout(sleepTime int64) {
 	for {
 		if rf.killed() {
 			return
@@ -426,6 +426,7 @@ func (rf *Raft) checkTimeout(maxTimeInterval int64, sleepTime int64) {
 		t := time.Since(rf.lastResetTime).Milliseconds()
 		role := rf.role
 		rf.mu.Unlock()
+		maxTimeInterval := rand.Int63n(300) + 300
 		if role != Leader && t > maxTimeInterval {
 			rf.mu.Lock()
 			// double check
@@ -435,7 +436,7 @@ func (rf *Raft) checkTimeout(maxTimeInterval int64, sleepTime int64) {
 				rf.votedFor = rf.me
 				rf.resetElectionTimer()
 				rf.votedForMe = make([]bool, len(rf.peers))
-				rf.printf("timeout %v ms, become candidate", t)
+				rf.printf("timeout %v ms, maxTimeInterval %v ms, become candidate", t, maxTimeInterval)
 				numServers := len(rf.peers)
 				lastLogIndex := len(rf.log) - 1
 				lastLogTerm := -1
@@ -686,8 +687,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	maxTimeInterval := rand.Int63n(300) + 300
-	go rf.checkTimeout(maxTimeInterval, 50)
+	go rf.checkTimeout(30)
 	go rf.checkElection()
 	go rf.checkCommit()
 	go rf.keepHeartbeat(120)
