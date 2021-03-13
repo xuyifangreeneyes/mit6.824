@@ -82,11 +82,11 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	role            Role
-	lastResetTime   time.Time           // election timer
+	lastResetTime   time.Time // election timer
 	winElectionCh   chan struct{}
 	newVoteCh       chan struct{}
 	appendSuccessCh chan struct{}
-	newCommitCh     chan int
+	newCommitCh     chan struct{}
 	applyCh         chan ApplyMsg
 	raftState
 }
@@ -105,17 +105,17 @@ type raftState struct {
 	commitIndex int
 	lastApplied int
 	// volatile state on leaders
-	nextIndex   []int
-	matchIndex  []int
+	nextIndex  []int
+	matchIndex []int
 	// volatile state on candidates
-	votedForMe  []bool
+	votedForMe []bool
 }
 
 //
 // rf must hold lock when calling the function.
 //
 func (rf *Raft) printf(format string, a ...interface{}) {
-	DPrintf(fmt.Sprintf("[id=%v] [term=%v] [time=%v] [role=%v] ", rf.me, rf.currentTerm, rf.role, time.Now().UnixNano() / int64(time.Millisecond)) + format, a...)
+	DPrintf(fmt.Sprintf("[id=%v] [term=%v] [time=%v] [role=%v] ", rf.me, rf.currentTerm, rf.role, time.Now().UnixNano()/int64(time.Millisecond))+format, a...)
 }
 
 // return currentTerm and whether this server
@@ -143,7 +143,6 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-
 //
 // restore previously persisted state.
 //
@@ -165,9 +164,6 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.yyy = yyy
 	// }
 }
-
-
-
 
 //
 // example RequestVote RPC arguments structure.
@@ -364,12 +360,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRelpy
 	reply.Success = true
 	startIndex := args.PrevLogIndex + 1
 	for i, entry := range args.Entries {
-		if startIndex + i == len(rf.log) {
+		if startIndex+i == len(rf.log) {
 			rf.log = append(rf.log, args.Entries[i:]...)
 			break
 		}
-		if entry.Term != rf.log[startIndex + i].Term {
-			rf.log = append(rf.log[:startIndex + i], args.Entries[i:]...)
+		if entry.Term != rf.log[startIndex+i].Term {
+			rf.log = append(rf.log[:startIndex+i], args.Entries[i:]...)
 			break
 		}
 	}
@@ -385,7 +381,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRelpy
 		if rf.commitIndex > oldCommitIndex {
 			rf.printf("commitIndex from %v to %v, len(log) = %v", oldCommitIndex, rf.commitIndex, len(rf.log))
 			rf.mu.Unlock()
-			rf.newCommitCh <- rf.commitIndex
+			rf.newCommitCh <- struct{}{}
 		} else {
 			rf.mu.Unlock()
 		}
@@ -428,11 +424,11 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 		rf.nextIndex[server] = rf.nextIndex[server] - 1
 		prevLogIndex := rf.nextIndex[server] - 1
 		newArgs := &AppendEntriesArgs{
-			Term: rf.currentTerm,
-			LeaderId: rf.me,
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
 			PrevLogIndex: prevLogIndex,
-			PrevLogTerm: rf.log[prevLogIndex].Term,
-			Entries: rf.log[prevLogIndex + 1:],
+			PrevLogTerm:  rf.log[prevLogIndex].Term,
+			Entries:      rf.log[prevLogIndex+1:],
 			LeaderCommit: rf.commitIndex,
 		}
 		rf.mu.Unlock()
@@ -463,10 +459,10 @@ func (rf *Raft) checkTimeout(sleepTime int64) {
 				numServers := len(rf.peers)
 				lastLogIndex := len(rf.log) - 1
 				args := &RequestVoteArgs{
-					Term: rf.currentTerm,
-					CandidateId: rf.me,
+					Term:         rf.currentTerm,
+					CandidateId:  rf.me,
 					LastLogIndex: lastLogIndex,
-					LastLogTerm: rf.log[lastLogIndex].Term,
+					LastLogTerm:  rf.log[lastLogIndex].Term,
 				}
 				for i := 0; i < numServers; i++ {
 					if i == rf.me {
@@ -484,44 +480,42 @@ func (rf *Raft) checkTimeout(sleepTime int64) {
 
 func (rf *Raft) checkElection() {
 	for {
-		<- rf.newVoteCh
+		<-rf.newVoteCh
 		if rf.killed() {
 			return
 		}
-		func() {
-			rf.mu.Lock()
-			if rf.role != Candidate {
-				rf.mu.Unlock()
-				return
+		rf.mu.Lock()
+		if rf.role != Candidate {
+			rf.mu.Unlock()
+			continue
+		}
+		numVotes := 1
+		for i, vote := range rf.votedForMe {
+			if i != rf.me && vote {
+				numVotes++
 			}
-			numVotes := 1
-			for i, vote := range rf.votedForMe {
-				if i != rf.me && vote  {
-					numVotes++
-				}
+		}
+		if numVotes > len(rf.peers)/2 {
+			rf.role = Leader
+			numServers := len(rf.peers)
+			numLogEntries := len(rf.log)
+			rf.nextIndex = make([]int, numServers)
+			rf.matchIndex = make([]int, numServers)
+			for i := 0; i < numServers; i++ {
+				rf.nextIndex[i] = numLogEntries
 			}
-			if numVotes > len(rf.peers) / 2 {
-				rf.role = Leader
-				numServers := len(rf.peers)
-				numLogEntries := len(rf.log)
-				rf.nextIndex = make([]int, numServers)
-				rf.matchIndex = make([]int, numServers)
-				for i := 0; i < numServers; i++ {
-					rf.nextIndex[i] = numLogEntries
-				}
-				rf.printf("win election, become leader")
-				rf.mu.Unlock()
-				rf.winElectionCh <- struct{}{}
-			} else {
-				rf.mu.Unlock()
-			}
-		}()
+			rf.printf("win election, become leader")
+			rf.mu.Unlock()
+			rf.winElectionCh <- struct{}{}
+		} else {
+			rf.mu.Unlock()
+		}
 	}
 }
 
 func (rf *Raft) checkCommit() {
 	for {
-		<- rf.appendSuccessCh
+		<-rf.appendSuccessCh
 		if rf.killed() {
 			return
 		}
@@ -543,7 +537,7 @@ func (rf *Raft) checkCommit() {
 					rf.commitIndex = i
 					rf.printf("commitIndex from %v to %v", oldCommitIndex, rf.commitIndex)
 					rf.mu.Unlock()
-					rf.newCommitCh <- rf.commitIndex
+					rf.newCommitCh <- struct{}{}
 					return
 				}
 			}
@@ -563,11 +557,11 @@ func (rf *Raft) broadcast() {
 		}
 		prevLogIndex := rf.nextIndex[i] - 1
 		args := &AppendEntriesArgs{
-			Term: rf.currentTerm,
-			LeaderId: rf.me,
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
 			PrevLogIndex: prevLogIndex,
-			PrevLogTerm: rf.log[prevLogIndex].Term,
-			Entries: rf.log[prevLogIndex + 1:],
+			PrevLogTerm:  rf.log[prevLogIndex].Term,
+			Entries:      rf.log[prevLogIndex+1:],
 			LeaderCommit: rf.commitIndex,
 		}
 		go rf.handleAppendEntries(i, args)
@@ -576,7 +570,7 @@ func (rf *Raft) broadcast() {
 
 func (rf *Raft) keepHeartbeat(timeInterval int64) {
 	for {
-		<- rf.winElectionCh
+		<-rf.winElectionCh
 		if rf.killed() {
 			return
 		}
@@ -598,23 +592,31 @@ func (rf *Raft) keepHeartbeat(timeInterval int64) {
 
 func (rf *Raft) applyLog() {
 	for {
-		// Get commitIndex from channel rather than lock and get it from struct. Is it wired?
-		commitIndex := <- rf.newCommitCh
+		<-rf.newCommitCh
 		//rf.printf("receive new commitIndex %v", commitIndex)
 		if rf.killed() {
 			return
 		}
-		for rf.lastApplied < commitIndex {
+		rf.mu.Lock()
+		if rf.lastApplied < rf.commitIndex {
 			// How to ensure atomicity?
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command: rf.log[rf.lastApplied + 1].Command,
-				CommandIndex: rf.lastApplied + 1,
+			lastApplied := rf.lastApplied
+			applyMsgs := make([]ApplyMsg, rf.commitIndex-lastApplied)
+			for rf.lastApplied < rf.commitIndex {
+				applyMsgs[rf.lastApplied-lastApplied] = ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[rf.lastApplied+1].Command,
+					CommandIndex: rf.lastApplied + 1,
+				}
+				rf.lastApplied++
 			}
-			rf.mu.Lock()
-			rf.printf("apply log %v", rf.lastApplied + 1)
+			rf.printf("apply log %v-%v", lastApplied+1, rf.lastApplied)
 			rf.mu.Unlock()
-			rf.lastApplied++
+			for _, applyMsg := range applyMsgs {
+				rf.applyCh <- applyMsg
+			}
+		} else {
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -643,11 +645,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 	logEntry := LogEntry{
-		Term: rf.currentTerm,
+		Term:    rf.currentTerm,
 		Command: command,
 	}
 	rf.log = append(rf.log, logEntry)
-	rf.printf("start new command, index=%v, term=%v", len(rf.log) - 1, rf.currentTerm)
+	rf.printf("start new command, index=%v, term=%v", len(rf.log)-1, rf.currentTerm)
 	rf.broadcast()
 	// Your code here (2B).
 
@@ -699,7 +701,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.winElectionCh = make(chan struct{})
 	rf.newVoteCh = make(chan struct{})
 	rf.appendSuccessCh = make(chan struct{})
-	rf.newCommitCh = make(chan int)
+	rf.newCommitCh = make(chan struct{})
 	rf.applyCh = applyCh
 	rf.votedFor = -1
 	rf.log = make([]LogEntry, 1, 10) // Since the first index of log is 1, we fill an empty entry into rf.log[0]
