@@ -115,7 +115,7 @@ type raftState struct {
 // rf must hold lock when calling the function.
 //
 func (rf *Raft) printf(format string, a ...interface{}) {
-	DPrintf(fmt.Sprintf("[id=%v] [term=%v] [time=%v] [role=%v] ", rf.me, rf.currentTerm, rf.role, time.Now().UnixNano()/int64(time.Millisecond))+format, a...)
+	DPrintf(fmt.Sprintf("[id=%v] [term=%v] [role=%v] [time=%v] ", rf.me, rf.currentTerm, rf.role, time.Now().UnixNano()/int64(time.Millisecond))+format, a...)
 }
 
 // return currentTerm and whether this server
@@ -308,7 +308,10 @@ func (rf *Raft) handleRequestVote(server int, args *RequestVoteArgs) {
 		rf.mu.Unlock()
 		return
 	}
-	if reply.VoteGranted {
+	// We release the lock before sending RequestVote RPC and get the lock again after receiving the reply of RequestVote
+	// RPC. During the period without the lock, rf.role may change (promoting to Leader or demoting to Follower). So we
+	// need to check that rf.role is still Candidate. If rf.role is not Candidate anymore, we can ignore the reply.
+	if rf.role == Candidate && reply.VoteGranted {
 		rf.votedForMe[server] = true
 		rf.printf("voted by %v", server)
 		rf.mu.Unlock()
@@ -344,13 +347,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRelpy
 		rf.updateTerm(args.Term)
 	} else if rf.role == Candidate {
 		rf.role = Follower
-		rf.votedFor = -1
 		rf.nextIndex = nil
 		rf.matchIndex = nil
 		rf.votedForMe = nil
 		rf.printf("see current term leader, become follower")
 	}
 	reply.Term = rf.currentTerm
+	// We need to set rf.votedFor to args.LeaderId since the server has seen the leader of the current term.
+	// If we set rf.votedFor to -1, the server may vote for some candidate of the current term.
+	rf.votedFor = args.LeaderId
 	rf.resetElectionTimer()
 	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
