@@ -409,6 +409,7 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 		return
 	}
 	if args.Term != rf.currentTerm {
+		// If the server is not the leader anymore after receiving the reply, it must step to a new term and `args.Term != rf.currentTerm` must stand.
 		// When receiving an old RPC reply, just drop the reply and return.
 		rf.mu.Unlock()
 		return
@@ -428,12 +429,15 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 	} else {
 		rf.nextIndex[server] = rf.nextIndex[server] - 1
 		prevLogIndex := rf.nextIndex[server] - 1
+		// We choose to copy log entries rather than take a slice to avoid data race?
+		entries := make([]LogEntry, len(rf.log[prevLogIndex+1:]))
+		copy(entries, rf.log[prevLogIndex+1:])
 		newArgs := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  rf.log[prevLogIndex].Term,
-			Entries:      rf.log[prevLogIndex+1:],
+			Entries:      entries,
 			LeaderCommit: rf.commitIndex,
 		}
 		rf.mu.Unlock()
